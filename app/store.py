@@ -7,8 +7,11 @@ Consistency model:
   Committed content is immutable: further uploads to that build are rejected.
 - Status evaluation and commit run inside a single IMMEDIATE transaction, so
   concurrent commits/fetches observe either the old or the new state, never a
-  torn one. Hashing and blob writes happen outside any DB transaction, so
-  other keys keep committing/fetching while a large file is processed.
+  torn one. Hashing, reference comparison and blob writes happen outside any DB
+  transaction, so other keys keep committing/fetching while a large file is
+  processed.
+- An upload whose bytes equal a committed file of the same (key, kind) writes
+  no blob at all; find_reference() supplies that comparison target.
 - A key is a cache hit only when >= quorum committed builds (distinct
   build_ids) have identical digests for every required file.
 - If any two committed builds for a key differ, the key is permanently
@@ -109,6 +112,37 @@ class Store:
         else:
             os.replace(tmp_path, final)  # atomic on same filesystem
         return final
+
+    def find_reference(self, key: str, kind: str) -> dict | None:
+        """Pick one committed file of *kind* for *key* to dedup against.
+
+        A reference is usable only if its content-addressed blob is present with
+        the recorded size.  Content-addressed blobs are immutable, so the path
+        identifies exactly the committed bytes.  The lookup uses a short read
+        transaction and does not block other writers.
+        """
+        with closing(self._connect()) as conn, _tx(conn):
+            row = conn.execute(
+                """
+                SELECT f.sha256 AS sha256, f.size AS size
+                FROM files f
+                JOIN builds b
+                  ON b.input_key=f.input_key AND b.build_id=f.build_id
+                WHERE b.input_key=? AND b.committed=1 AND f.kind=?
+                ORDER BY b.committed_at DESC, b.build_id DESC
+                LIMIT 1
+                """,
+                (key, kind),
+            ).fetchone()
+        if row is None:
+            return None
+        path = self.blob_path(row["sha256"])
+        try:
+            if os.path.getsize(path) != row["size"]:
+                return None
+        except OSError:
+            return None
+        return {"sha256": row["sha256"], "size": row["size"], "path": path}
 
     # ---------------------------------------------------------------- uploads
 

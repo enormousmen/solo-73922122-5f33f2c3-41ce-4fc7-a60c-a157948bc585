@@ -38,7 +38,33 @@ GET  /v1/keys/{key}/files/image    # 200 bytes | 404 miss | 409 disabled
 GET  /v1/keys/{key}/files/symbols
 ```
 
-Interactive docs at `/docs`. See `examples/demo.sh` for a full walkthrough.
+Interactive docs at `/docs`. See `examples/demo.sh` for a full walkthrough and
+`examples/dedup-demo.sh` for the upload-dedup behavior.
+
+## Upload dedup
+
+Builds from different machines usually produce byte-identical artifacts, so
+the upload endpoint compares the received body **while streaming** against one
+already-committed file of the same `(key, kind)`. The reference is available as
+soon as a single build has committed — no quorum required.
+
+- Bytes are compared in 1 MiB blocks, in the order received. Extra memory is
+  bounded by the block size and does not grow with the file.
+- If the whole body matches (same length, same SHA-256), **no temp file and no
+  blob is written**; only the staging row for `(key, build, kind)` is updated.
+  The response carries `"deduplicated": true`.
+- On the first differing block — including a difference in the final byte, an
+  upload that is a strict prefix of the reference, or trailing extra bytes —
+  the matched prefix is copied from the reference into a temp file and the rest
+  of the actual request is appended, so the staged bytes are exactly the bytes
+  received. Commit then applies normal conflict detection.
+- The per-file size limit is unchanged (`Content-Length` rejected up front, the
+  streamed byte count enforced otherwise). On disconnect, size overflow or disk
+  error the temp file is removed and any previously staged record for that
+  build is left untouched.
+- Comparison, hashing and writes happen outside any DB transaction, so other
+  keys keep committing and fetching meanwhile.
+- A missing/unreadable reference blob simply falls back to a plain upload.
 
 ## Semantics
 
@@ -64,4 +90,5 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python -m pytest tests/ -q     # includes live-server concurrency tests
 CACHE_DATA_DIR=$(mktemp -d) .venv/bin/uvicorn app.main:app --port 8080 &
 ./examples/demo.sh http://localhost:8080
+./examples/dedup-demo.sh http://localhost:8080
 ```

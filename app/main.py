@@ -2,10 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
 import re
-import tempfile
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -17,6 +15,7 @@ from .store import (
     IncompleteBuildError,
     Store,
 )
+from .upload import Reference, UploadTooLarge, receive_upload
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -64,35 +63,48 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 detail=f"file exceeds {limit} bytes limit",
             )
 
-        # Stream to a temp file while hashing; no DB transaction is held here,
-        # so other keys keep committing/fetching during the upload.
-        fd, tmp_path = tempfile.mkstemp(dir=store.tmp_dir, prefix="upload-")
-        hasher = hashlib.sha256()
-        size = 0
+        # Deduplicate against one committed file of the same kind for this key.
+        # The comparison and any spooling happen outside a DB transaction, so
+        # other keys keep committing and fetching meanwhile.  Identical bytes
+        # never touch the blob store or a temp file; the staged record alone is
+        # updated afterwards.  Any failure leaves previous staging untouched.
+        found = await asyncio.to_thread(store.find_reference, key, kind)
+        reference = None
+        if found is not None:
+            reference = Reference(
+                sha256=found["sha256"], size=found["size"], path=found["path"]
+            )
+
         try:
-            with os.fdopen(fd, "wb") as out:
-                async for chunk in request.stream():
-                    size += len(chunk)
-                    if size > limit:
-                        raise HTTPException(
-                            status_code=413,
-                            detail=f"file exceeds {limit} bytes limit",
-                        )
-                    hasher.update(chunk)
-                    out.write(chunk)
-            sha256 = hasher.hexdigest()
-            await asyncio.to_thread(store.adopt_blob, tmp_path, sha256)
+            result = await receive_upload(
+                request.stream(),
+                limit=limit,
+                tmp_dir=store.tmp_dir,
+                reference=reference,
+            )
+        except UploadTooLarge as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+
+        try:
+            if result.tmp_path is not None:
+                await asyncio.to_thread(
+                    store.adopt_blob, result.tmp_path, result.sha256
+                )
         except BaseException:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            if result.tmp_path is not None and os.path.exists(result.tmp_path):
+                try:
+                    os.remove(result.tmp_path)
+                except OSError:
+                    pass
             raise
 
         try:
             record = await asyncio.to_thread(
-                store.stage_file, key, build, kind, sha256, size
+                store.stage_file, key, build, kind, result.sha256, result.size
             )
         except BuildCommittedError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        record["deduplicated"] = result.deduplicated
         return record
 
     @app.post("/v1/keys/{key}/builds/{build}/commit")
